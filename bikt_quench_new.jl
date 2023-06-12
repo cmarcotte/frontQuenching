@@ -4,9 +4,6 @@ using CairoMakie, MathTeXEngine
 include("bikt.jl")
 using .bikt
 
-@warn "There is some sort of memory leak in this code!"
-@warn "There is some sort of intermittent mis-write where the solution is incorrect (and clearly so) likely due to a parallelism issue!"
-
 const L = 1000.0
 const N = 1+2^12
 const h = L/(N-1)
@@ -148,12 +145,16 @@ function adapt(p, set;
 		function plotResolved()
 			Us = readdlm("./resolved_$(set).dat");
 			inds = findall(.~isnan.(Us[:,3]))
+			dfs = [maximum(Us[inds,n])-minimum(Us[inds,n]) for n in size(Us,2)];
+			tri = all(dfs .> 0.0)
 			fig = Figure(fonts = (; regular = texfont(), bold = texfont()))
 			ga = fig[1,1] = GridLayout()
 			axs = Axis(ga[1,1], xlabel = L"$x_s$", ylabel = L"\theta");
-			tr1 = tricontourf!(axs, Us[inds,1], Us[inds,2], Us[inds,3], colormap=:Oranges, colorrange=(-1000.0,0.0))
+			if tri
+				tr1 = tricontourf!(axs, Us[inds,1], Us[inds,2], Us[inds,3], colormap=:Oranges, colorrange=(-1000.0,0.0))
+				Colorbar(ga[1, 2], tr1, label=L"$U_s$")
+			end
 			scatter!(Us[inds,1], Us[inds,2], color=Us[inds,3], colormap=:Oranges, strokewidth=1, markersize=3, strokecolor=:black)
-			Colorbar(ga[1, 2], tr1, label=L"$U_s$")
 			xlims!(axs, [lower_bound[1], upper_bound[1]])
 			ylims!(axs, [lower_bound[2], upper_bound[2]])
 			save("./resolved_$(set).pdf", fig, pt_per_unit=1);
@@ -161,9 +162,11 @@ function adapt(p, set;
 		end	
 		
 		function writeResolved(xs, th, Us; lck=resolved_lock)
-			open("./resolved_$(set).dat","a") do io
-				writedlm(io, [xs th Us]);
-				@info "Appended $([xs th Us]) to './resolved_$(set).dat'."
+			lock(resolved_lock) do
+				open("./resolved_$(set).dat","a") do io
+					writedlm(io, [xs th Us]);
+					@info "Appended $([xs th Us]) to './resolved_$(set).dat'."
+				end
 			end
 			return nothing
 		end
@@ -184,11 +187,11 @@ function adapt(p, set;
 				zp = ZeroProblem(ff, Us_lims)
 				Us = solve(zp, method; verbose=true, xatol=atol, xrtol=rtol)
 			end
-			lock(lck) do
-				writeResolved(xs, th, Us)
-			end
+			
+			writeResolved(xs, th, Us);
+			
 			if !isnan(Us)
-				f([xs th Us]; pltt=true);
+				f([xs, th, Us]; pltt=true);
 				try
 					plotResolved()
 				catch err

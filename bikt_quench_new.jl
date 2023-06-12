@@ -18,8 +18,13 @@ const atol = 1e-06
 const rtol = 1e-06
 const jac_upper = max(length(B.a_l), length(B.a_r), (δ1.stencil_length-1)÷2, (δ2.stencil_length-1)÷2)
 
+const sampled_lock = ReentrantLock();
+const resolved_lock = ReentrantLock();
+
+const plotting = parse(Bool, ARGS[1])
+const writing  = parse(Bool, ARGS[2])
+
 function H(x, k)
-	#return 0.5*(1.0+sign(x))
 	return 0.5*(1.0+tanh(k*x))
 end
 
@@ -39,7 +44,6 @@ function f!(dx, x, p, t)
 			dv[n] = (H(-u[n], k)-v[n])/tau
 		end
 	end
-	#mul!(du, ∇, u, -c, 1.0)	# mul!(C, A, B, a, b) = A*B*a + C*b
 	mul!(du, Δ, u, 1.0, 1.0) 	# mul!(C, A, B, a, b) = A*B*a + C*b -> du .= (Δ*u)*(ep/Cm) .+ du.*(1.0/(ENa-E1)); correct
 	
 	return nothing
@@ -59,8 +63,6 @@ function Ψ(u)
 	return sqrt(integrate(spl2, minimum(ξ), maximum(ξ)))
 end
 
-const sampled_lock = ReentrantLock();
-const resolved_lock = ReentrantLock();
 function adapt(p, set; 
 			lower_bound = [+(2*h), minimum(ξ)+(L/4)+h],
 			upper_bound = [+(L/2), maximum(ξ)-(L/4)-h], 
@@ -90,34 +92,39 @@ function adapt(p, set;
 		tspan = (0., round(0.95*abs(ξ[begin])/p̌[:c]));
 		u0 = copy(ǔ);
 		p = [p̌[:tau], p̌[:k], 0.0]
-
+		
+		function plotSol(sol)
+			if plotting
+				let fig = Figure(fonts = (; regular = texfont(), bold = texfont()))
+					ga = fig[1,1] = GridLayout()
+					axs = [Axis(ga[1,1], xlabel = "", ylabel = L"$x$"), Axis(ga[2,1], xlabel = L"$t$", ylabel = L"$\phi(t) - \hat{\phi}$")]
+					hm1 = heatmap!(axs[1], sol.t, ξ, transpose(sol[1,:,:]), colormap=:viridis, colorrange = (-p̌[:alpha], p̌[:omega]), rasterize=4, highclip = :pink, lowclip = :red)
+					Colorbar(ga[0, 1], hm1, label=L"$u_1(t, x)$", vertical=false, flipaxis=true, ticks = ([-p̌[:alpha] , 0.0, 1.0, p̌[:omega]], [L"-\alpha", "0.0", "1.0", L"\omega"]))
+					lines!(axs[2], sol.t, [Ψ(sol[1,:,n]) for n in 1:size(sol,3)] .- ψ̂, label=L"$\phi(t)-\hat{\phi}$")
+					xlims!.(axs, tspan[begin], tspan[end])
+					ylims!(axs[1], ξ[begin], ξ[end])
+					hidexdecorations!(axs[1], ticks=false, label=false, ticklabels=true)
+					save("./bikt_sol.pdf", fig, pt_per_unit=1);
+				end
+			end
+			return nothing
+		end
+		
+		function writeSamples(q, psi)
+			if writing
+				open("./sampled_$(set).dat","a") do io
+					writedlm(io, [q[1] q[2] q[3] psi]);
+					@info "Appended $([q[1] q[2] q[3] psi]) to './sampled_$(set).dat'."
+				end
+			end
+			return nothing
+		end
+		
 		function X(q; H = sign) # H = x->0.5*(1.0+tanh(100.0*x))
 			xs, th, A = q
 			out = zeros(Float64,2,N)
 			out[1,:] .= (A/4.0) .* (1.0.+H.(ξ.-th.+xs/2.0)) .* (1.0.-H.(ξ.-th.-xs/2.0))
 			return out
-		end
-		
-		function plotSol(sol)
-			fig = Figure(fonts = (; regular = texfont(), bold = texfont()))
-			ga = fig[1,1] = GridLayout()
-			axs = [Axis(ga[1,1], xlabel = "", ylabel = L"$x$"), Axis(ga[2,1], xlabel = L"$t$", ylabel = L"$\phi(t) - \hat{\phi}$")]
-			hm1 = heatmap!(axs[1], sol.t, ξ, transpose(sol[1,:,:]), colormap=:viridis, colorrange = (-p̌[:alpha], p̌[:omega]), rasterize=4, highclip = :pink, lowclip = :red)
-			Colorbar(ga[0, 1], hm1, label=L"$u_1(t, x)$", vertical=false, flipaxis=true, ticks = ([-p̌[:alpha] , 0.0, 1.0, p̌[:omega]], [L"-\alpha", "0.0", "1.0", L"\omega"]))
-			lines!(axs[2], sol.t, [Ψ(sol[1,:,n]) for n in 1:size(sol,3)] .- ψ̂, label=L"$\phi(t)-\hat{\phi}$")
-			xlims!.(axs, tspan[begin], tspan[end])
-			ylims!(axs[1], ξ[begin], ξ[end])
-			hidexdecorations!(axs[1], ticks=false, label=false, ticklabels=true)
-			save("./bikt_sol.pdf", fig, pt_per_unit=1);
-			return nothing
-		end
-		
-		function writeSamples(q, psi)
-			open("./sampled_$(set).dat","a") do io
-				writedlm(io, [q[1] q[2] q[3] psi]);
-				@info "Appended $([q[1] q[2] q[3] psi]) to './sampled_$(set).dat'."
-			end
-			return nothing
 		end
 		
 		function f(q; pltt = false, lck = sampled_lock)
@@ -132,9 +139,9 @@ function adapt(p, set;
 			psi = Ψ(sol[1,:,end])
 			lock(lck) do
 				if pltt
-					plotSol(sol)
+					plotSol(sol);
 				else
-					writeSamples(q, psi)
+					writeSamples(q, psi);
 				end
 			end
 			return psi
@@ -142,27 +149,32 @@ function adapt(p, set;
 		
 		@assert f([0.0, 0.0, 0.0]; pltt=true) > ψ̂
 		
-		function plotResolved()
-			Us = readdlm("./resolved_$(set).dat");
-			inds = findall(.~isnan.(Us[:,3]))
-			dfs = [maximum(Us[inds,n])-minimum(Us[inds,n]) for n in size(Us,2)];
-			tri = all(dfs .> 0.0)
-			fig = Figure(fonts = (; regular = texfont(), bold = texfont()))
-			ga = fig[1,1] = GridLayout()
-			axs = Axis(ga[1,1], xlabel = L"$x_s$", ylabel = L"\theta");
-			if tri
-				tr1 = tricontourf!(axs, Us[inds,1], Us[inds,2], Us[inds,3], colormap=:Oranges, colorrange=(-1000.0,0.0))
-				Colorbar(ga[1, 2], tr1, label=L"$U_s$")
+		function plotResolved(set)
+			if plotting
+				let dat = readdlm("./resolved_$(set).dat");
+					inds = findall(.~isnan.(dat[:,3]))
+					cind = findall(isnan.(dat[:,3]))
+					dfs = [maximum(dat[inds,n])-minimum(dat[inds,n]) for n in size(dat,2)];
+					tri = all(dfs .> 0.0)
+					fig = Figure(fonts = (; regular = texfont(), bold = texfont()))
+					ga = fig[1,1] = GridLayout()
+					axs = Axis(ga[1,1], xlabel = L"$x_s$", ylabel = L"\theta");
+					if tri
+						tr1 = tricontourf!(axs, dat[inds,1], dat[inds,2], dat[inds,3], colormap=:Oranges, colorrange=(-1000.0,0.0))
+						Colorbar(ga[1, 2], tr1, label=L"$U_s$")
+					end
+					scatter!(dat[inds,1], dat[inds,2], color=dat[inds,3], colormap=:Oranges, strokewidth=1, markersize=3, strokecolor=:black)
+					scatter!(dat[cind,1], dat[cind,2], strokewidth=1, markersize=3, strokecolor=:black)
+					xlims!(axs, [lower_bound[1], upper_bound[1]])
+					ylims!(axs, [lower_bound[2], upper_bound[2]])
+					save("./resolved_$(set).pdf", fig, pt_per_unit=1);
+				end
 			end
-			scatter!(Us[inds,1], Us[inds,2], color=Us[inds,3], colormap=:Oranges, strokewidth=1, markersize=3, strokecolor=:black)
-			xlims!(axs, [lower_bound[1], upper_bound[1]])
-			ylims!(axs, [lower_bound[2], upper_bound[2]])
-			save("./resolved_$(set).pdf", fig, pt_per_unit=1);
 			return nothing
 		end	
-		
-		function writeResolved(xs, th, Us; lck=resolved_lock)
-			lock(resolved_lock) do
+
+		function writeResolved(xs, th, Us, set)
+			if writing
 				open("./resolved_$(set).dat","a") do io
 					writedlm(io, [xs th Us]);
 					@info "Appended $([xs th Us]) to './resolved_$(set).dat'."
@@ -175,7 +187,8 @@ function adapt(p, set;
 			xs, th = q
 			function ff(A::Float64)
 				qq = (xs, th, A)
-				return f(qq)-ψ̂		# call model
+				tmp = f(qq)-ψ̂		# call model
+				return tmp
 			end
 			
 			while sign(ff(minimum(Us_lims))) == sign(ψ̌ -ψ̂) && abs(minimum(Us_lims)-maximum(Us_lims)) > rtol
@@ -187,27 +200,27 @@ function adapt(p, set;
 				zp = ZeroProblem(ff, Us_lims)
 				Us = solve(zp, method; verbose=true, xatol=atol, xrtol=rtol)
 			end
-			
-			writeResolved(xs, th, Us);
-			
+			lock(resolved_lock) do
+				writeResolved(xs, th, Us, set);
+			end
 			if !isnan(Us)
 				f([xs, th, Us]; pltt=true);
 				try
-					plotResolved()
+					plotResolved(set);
 				catch err
 					@show err
 				end
+				return Us
 			else
 				return Us_fail
 			end
-			return Us
 		end
 
 		Us = AdaptiveSparseGrid(g, 
 						lower_bound, upper_bound,
 						max_depth = max_depth,	# The maximum depth of basis elements in 
 										# each dimension
-						tol = 1.0e-1)		# Add nodes when 
+						tol = 1.0e+0)		# Add nodes when 
 										# min(abs(alpha/f(x)), abs(alpha)) < tol
 		@save "fun_$(set).jld2" Us
 		
@@ -221,9 +234,16 @@ function main()
 			Dict(:alpha => 0.5625, :tau => 7.7) ]
 	sets 	= [ 1,2,3,4 ]
 	
+	#=
 	for (p,set) in zip(ps, sets)
-		adapt(p, set);
+		adapt(p, set; max_depth = 9);
 	end
+	=#
+	
+	set = parse(Int, ARGS[3]);
+	rm("./sampled_$(set).dat", force=true)
+	rm("./resolved_$(set).dat", force=true)
+	adapt(ps[set], set; max_depth=9);
 	
 	return nothing
 end

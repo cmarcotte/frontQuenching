@@ -1,5 +1,5 @@
-using DelimitedFiles, DifferentialEquations, DiffEqOperators, Dierckx, SparseArrays, Roots, Sundials, LinearAlgebra, LoopVectorization, JLD2
-using AdaptiveSparseGrids
+using DelimitedFiles, DifferentialEquations, DiffEqOperators, Dierckx, SparseArrays, Roots, Sundials, LinearAlgebra, LoopVectorization, Symbolics
+using AdaptiveSparseGrids, JLD2
 using CairoMakie, MathTeXEngine
 include("bikt.jl")
 using .bikt
@@ -36,10 +36,10 @@ function f!(dx, x, p, t)
 	du = @view dx[1,:]
 	dv = @view dx[2,:]
 	
-	@views tau, k, c = p[1:3]
+	@views tau, k = p[1:2]
 	
 	@inbounds begin
-		@turbo for n in eachindex(u,v,du,dv)
+		@turbo warn_check_args=false for n in eachindex(u,v,du,dv)
 			du[n] = H(u[n]-1.0, k)*v[n]
 			dv[n] = (H(-u[n], k)-v[n])/tau
 		end
@@ -91,7 +91,10 @@ function adapt(p, set;
 		# set integration parameters
 		tspan = (0., round(0.95*abs(ξ[begin])/p̌[:c]));
 		u0 = copy(ǔ);
-		p = [p̌[:tau], p̌[:k], 0.0]
+		p = [p̌[:tau], p̌[:k]]
+		
+		du0 = similar(u0);
+		jac_sparsity = Symbolics.jacobian_sparsity((du, u) -> f!(du, u, p, 0.0), du0, u0)
 		
 		function plotSol(sol)
 			if plotting
@@ -112,9 +115,11 @@ function adapt(p, set;
 		
 		function writeSamples(q, psi)
 			if writing
-				open("./sampled_$(set).dat","a") do io
-					writedlm(io, [q[1] q[2] q[3] psi]);
-					@info "Appended $([q[1] q[2] q[3] psi]) to './sampled_$(set).dat'."
+				lock(sampled_lock) do
+					open("./sampled_$(set).dat","a") do io
+						writedlm(io, [q[1] q[2] q[3] psi]);
+						@info "Appended $([q[1] q[2] q[3] psi]) to './sampled_$(set).dat'."
+					end
 				end
 			end
 			return nothing
@@ -129,20 +134,22 @@ function adapt(p, set;
 		
 		function f(q; pltt = false, lck = sampled_lock)
 			u = u0 .+ X(q)
-			prob = ODEProblem(f!, u, tspan, p)
+			prob = ODEProblem(ODEFunction(f!; jac_prototype = float.(jac_sparsity)), u, tspan, p)
 			if pltt
 				saveat=range(tspan[begin], tspan[end]; length=257)
 			else
 				saveat=[tspan[end]]
 			end
+			#sol = solve(prob, CVODE_BDF(linear_solver=:GMRES); maxiters=Int(1e8), abstol=atol, reltol=rtol, saveat=saveat)
 			sol = solve(prob, CVODE_BDF(linear_solver=:Band, jac_upper=jac_upper, jac_lower=jac_upper); maxiters=Int(1e8), abstol=atol, reltol=rtol, saveat=saveat)
+			#sol = solve(prob, FBDF(linsolve=KrylovJL_GMRES()); maxiters=Int(1e8), abstol=atol, reltol=rtol, saveat=saveat)
+			#sol = solve(prob, KenCarp47(linsolve=KrylovJL_GMRES()); maxiters=Int(1e8), abstol=atol, reltol=rtol, saveat=saveat)
+			#sol = solve(prob, Tsit5(); maxiters=Int(1e8), abstol=atol, reltol=rtol, saveat=saveat)
 			psi = Ψ(sol[1,:,end])
-			lock(lck) do
-				if pltt
-					plotSol(sol);
-				else
-					writeSamples(q, psi);
-				end
+			if pltt
+				plotSol(sol);
+			else
+				writeSamples(q, psi);
 			end
 			return psi
 		end
@@ -154,17 +161,18 @@ function adapt(p, set;
 				let dat = readdlm("./resolved_$(set).dat");
 					inds = findall(.~isnan.(dat[:,3]))
 					cind = findall(isnan.(dat[:,3]))
-					dfs = [maximum(dat[inds,n])-minimum(dat[inds,n]) for n in size(dat,2)];
-					tri = all(dfs .> 0.0)
 					fig = Figure(fonts = (; regular = texfont(), bold = texfont()))
 					ga = fig[1,1] = GridLayout()
 					axs = Axis(ga[1,1], xlabel = L"$x_s$", ylabel = L"\theta");
-					if tri
-						tr1 = tricontourf!(axs, dat[inds,1], dat[inds,2], dat[inds,3], colormap=:Oranges, colorrange=(-1000.0,0.0))
+					try
+						dat[cind,3] .= +1000.0
+						tr1 = tricontourf!(axs, dat[:,1], dat[:,2], dat[:,3], colormap=:Oranges, levels=-1.0.*(10.0.^range(+3.0, -3.0; length=1+2^6)), extendhigh=:lightblue, extendlow=:blue)
 						Colorbar(ga[1, 2], tr1, label=L"$U_s$")
+					catch err
+						@error err
 					end
 					scatter!(dat[inds,1], dat[inds,2], color=dat[inds,3], colormap=:Oranges, strokewidth=1, markersize=3, strokecolor=:black)
-					scatter!(dat[cind,1], dat[cind,2], strokewidth=1, markersize=3, strokecolor=:black)
+					scatter!(dat[cind,1], dat[cind,2], colormap=:Blues, strokewidth=1, markersize=3, strokecolor=:black)
 					xlims!(axs, [lower_bound[1], upper_bound[1]])
 					ylims!(axs, [lower_bound[2], upper_bound[2]])
 					save("./resolved_$(set).pdf", fig, pt_per_unit=1);
@@ -175,15 +183,17 @@ function adapt(p, set;
 
 		function writeResolved(xs, th, Us, set)
 			if writing
-				open("./resolved_$(set).dat","a") do io
-					writedlm(io, [xs th Us]);
-					@info "Appended $([xs th Us]) to './resolved_$(set).dat'."
+				lock(resolved_lock) do
+					open("./resolved_$(set).dat","a") do io
+						writedlm(io, [xs th Us]);
+						@info "Appended $([xs th Us]) to './resolved_$(set).dat'."
+					end
 				end
 			end
 			return nothing
 		end
 		
-		function g(q; Us_lims=(-1.0e4, -0.0), method=Roots.A42(), lck = resolved_lock, Us_fail = +1.0)
+		function g(q; Us_lims=(-1.0e4, -0.0), method=Roots.A42(), lck = resolved_lock)
 			xs, th = q
 			function ff(A::Float64)
 				qq = (xs, th, A)
@@ -200,19 +210,18 @@ function adapt(p, set;
 				zp = ZeroProblem(ff, Us_lims)
 				Us = solve(zp, method; verbose=true, xatol=atol, xrtol=rtol)
 			end
-			lock(resolved_lock) do
-				writeResolved(xs, th, Us, set);
-			end
+			
+			writeResolved(xs, th, Us, set);
+			
 			if !isnan(Us)
 				f([xs, th, Us]; pltt=true);
 				try
 					plotResolved(set);
-				catch err
-					@show err
+				catch
 				end
-				return Us
+				return sign(Us)*log(abs(Us)./(abs(Us)*rtol + atol))
 			else
-				return Us_fail
+				return +1.0
 			end
 		end
 
@@ -220,19 +229,27 @@ function adapt(p, set;
 						lower_bound, upper_bound,
 						max_depth = max_depth,	# The maximum depth of basis elements in 
 										# each dimension
-						tol = 1.0e+0)		# Add nodes when 
+						tol = 0.25)		# Add nodes when 
 										# min(abs(alpha/f(x)), abs(alpha)) < tol
 		@save "fun_$(set).jld2" Us
 		
 	return nothing
 end
 
+#=
+function recursiveAdaptiveSampleGrid(n::Int, g::F, lb, ub) where F
+
+	x = QuasiMonteCarlo.sample(n, lb, ub, QuasiMonteCarlo.GridSample([(ub.-lb)./sqrt(n)]))
+	y = g.(x)
+end
+=#
+
 function main()
-	ps 	= [ 	Dict(:alpha => 1.0, :tau => 8.2),
-			Dict(:alpha => 1.0, :tau => 11.0), 
-			Dict(:alpha => 0.5625, :tau => 8.2), 
-			Dict(:alpha => 0.5625, :tau => 7.7) ]
-	sets 	= [ 1,2,3,4 ]
+	ps = [	Dict(:alpha => 1.0, 	:tau => 8.2),
+			Dict(:alpha => 1.0, 	:tau => 9.0), 
+			Dict(:alpha => 0.5625, 	:tau => 8.2), 
+			Dict(:alpha => 0.5625, 	:tau => 7.7) ]
+	sets = [ 1,2,3,4 ]
 	
 	#=
 	for (p,set) in zip(ps, sets)
